@@ -34,6 +34,10 @@ def _extract_url(raw_text: str, parsed: dict[str, Any]) -> str:
     if isinstance(parsed_url, str) and parsed_url.strip():
         return parsed_url.strip()
 
+    parsed_base = parsed.get("api_base_url")
+    if isinstance(parsed_base, str) and parsed_base.strip():
+        return parsed_base.strip()
+
     match = URL_PATTERN.search(raw_text)
     if match:
         return match.group(0)
@@ -78,7 +82,7 @@ def plan_task(task_input: str) -> list[dict[str, Any]]:
     parsed_input = _parse_structured_input(raw_input)
 
     should_run_api_test = "test" in lowered_input or any(
-        key in parsed_input for key in ("url", "method", "headers", "body")
+        key in parsed_input for key in ("url", "method", "headers", "body", "api_base_url", "endpoints", "endpoint_urls")
     )
     should_run_log_analysis = any(token in lowered_input for token in ("error", "logs", "log", "timeout")) or any(
         key in parsed_input for key in ("logs", "error")
@@ -88,10 +92,17 @@ def plan_task(task_input: str) -> list[dict[str, Any]]:
 
     if should_run_api_test:
         headers = parsed_input.get("headers") if isinstance(parsed_input.get("headers"), dict) else {}
+
+        endpoints = parsed_input.get("endpoints") if isinstance(parsed_input.get("endpoints"), list) else []
+        endpoint_urls = parsed_input.get("endpoint_urls") if isinstance(parsed_input.get("endpoint_urls"), list) else []
+
         api_step_input: dict[str, Any] = {
             "url": _extract_url(raw_input, parsed_input),
+            "api_base_url": parsed_input.get("api_base_url", ""),
             "method": _normalize_method(parsed_input),
             "headers": headers,
+            "endpoints": [ep for ep in endpoints if isinstance(ep, str)],
+            "endpoint_urls": [url for url in endpoint_urls if isinstance(url, str)],
         }
 
         if "body" in parsed_input:

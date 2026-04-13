@@ -1,18 +1,16 @@
-"""Metrics Collector — infrastructure for tool metrics, regression detection, and performance tracking.
+"""Metrics Collector — hybrid in-memory + DB-persistent tool metrics system.
 
-This module provides placeholders and interfaces that the system will use when
-advanced features (CI/CD integration, regression detection, historical tracking)
-are implemented.
+Provides:
+  - record_tool_execution(): track individual tool calls (in-memory + flush to DB)
+  - record_execution_summary(): track overall execution runs
+  - get_tool_metrics(): aggregate per-tool stats
+  - get_snapshot(): full metrics snapshot for API/dashboard consumption
+  - flush_to_db(): persist in-memory counters to the tool_metrics DB table
 
-Current capabilities:
-  - Collect per-tool execution metrics in memory
-  - Record execution summaries
-  - Provide a snapshot for external consumers (CI/CD, dashboards)
-
-Future extensions:
-  - Persist metrics to PostgreSQL or time-series DB
-  - Detect regressions by comparing against historical baselines
-  - Emit webhook notifications on threshold violations
+Architecture:
+  - In-memory counters for hot-path performance (no DB round-trip per call)
+  - Periodic or on-demand flush to PostgreSQL for durability
+  - DB read for authoritative stats via get_tool_metrics_from_db()
 """
 
 import logging
@@ -20,15 +18,25 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy.orm import Session
+
+from app.models.tool_metrics import ToolMetrics
+
 logger = logging.getLogger(__name__)
 
 
 class MetricsCollector:
-    """In-memory metrics collector for tool and execution performance."""
+    """Hybrid metrics collector: fast in-memory writes, durable DB persistence."""
 
     def __init__(self) -> None:
-        self._tool_metrics: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        # In-memory hot counters (flushed to DB periodically)
+        self._tool_calls: dict[str, int] = defaultdict(int)
+        self._tool_successes: dict[str, int] = defaultdict(int)
+        self._tool_failures: dict[str, int] = defaultdict(int)
+        self._tool_latencies: dict[str, list[float]] = defaultdict(list)
         self._execution_summaries: list[dict[str, Any]] = []
+
+    # ---- Recording (hot path — in-memory only) ----
 
     def record_tool_execution(
         self,
@@ -38,16 +46,19 @@ class MetricsCollector:
         attempts: int = 1,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        """Record a single tool execution for metrics tracking."""
-        entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "duration_ms": duration_ms,
-            "success": success,
-            "attempts": attempts,
-            "metadata": metadata or {},
-        }
-        self._tool_metrics[tool_name].append(entry)
-        logger.debug("Recorded metric for tool '%s': %dms, success=%s", tool_name, duration_ms, success)
+        """Record a single tool execution in memory."""
+        self._tool_calls[tool_name] += 1
+        self._tool_latencies[tool_name].append(float(duration_ms))
+
+        if success:
+            self._tool_successes[tool_name] += 1
+        else:
+            self._tool_failures[tool_name] += 1
+
+        logger.debug(
+            "Tool metric recorded: %s, %dms, success=%s, attempt=%d",
+            tool_name, duration_ms, success, attempts,
+        )
 
     def record_execution_summary(
         self,
@@ -57,7 +68,7 @@ class MetricsCollector:
         steps_failed: int,
         total_retries: int,
     ) -> None:
-        """Record an overall execution summary."""
+        """Record an overall execution summary in memory."""
         summary = {
             "task_id": task_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -67,78 +78,130 @@ class MetricsCollector:
             "total_retries": total_retries,
         }
         self._execution_summaries.append(summary)
-        logger.debug("Recorded execution summary for task '%s'.", task_id)
 
-    def get_tool_stats(self, tool_name: str) -> dict[str, Any]:
-        """Get aggregate statistics for a specific tool."""
-        entries = self._tool_metrics.get(tool_name, [])
-        if not entries:
-            return {
-                "tool": tool_name,
-                "total_executions": 0,
-                "avg_duration_ms": 0,
-                "success_rate": 0.0,
-                "avg_attempts": 0,
-            }
+        # Cap in-memory summaries to last 100
+        if len(self._execution_summaries) > 100:
+            self._execution_summaries = self._execution_summaries[-100:]
 
-        durations = [e["duration_ms"] for e in entries]
-        successes = sum(1 for e in entries if e["success"])
-        attempts_list = [e["attempts"] for e in entries]
+    # ---- Querying (in-memory fast read) ----
+
+    def get_tool_metrics(self, tool_name: str | None = None) -> dict[str, Any]:
+        """Get in-memory aggregate stats for one or all tools.
+
+        This is the function exposed per Part 3 requirements.
+        """
+        if tool_name:
+            return self._compute_tool_stats(tool_name)
 
         return {
-            "tool": tool_name,
-            "total_executions": len(entries),
-            "avg_duration_ms": round(sum(durations) / len(durations), 2),
-            "min_duration_ms": min(durations),
-            "max_duration_ms": max(durations),
-            "success_rate": round(successes / len(entries) * 100, 2),
-            "avg_attempts": round(sum(attempts_list) / len(attempts_list), 2),
+            name: self._compute_tool_stats(name)
+            for name in sorted(self._tool_calls.keys())
+        }
+
+    def _compute_tool_stats(self, tool_name: str) -> dict[str, Any]:
+        total = self._tool_calls.get(tool_name, 0)
+        successes = self._tool_successes.get(tool_name, 0)
+        failures = self._tool_failures.get(tool_name, 0)
+        latencies = self._tool_latencies.get(tool_name, [])
+
+        if total == 0:
+            return {
+                "tool_name": tool_name,
+                "total_calls": 0,
+                "success_count": 0,
+                "failure_count": 0,
+                "avg_latency_ms": 0.0,
+                "min_latency_ms": 0.0,
+                "max_latency_ms": 0.0,
+                "success_rate": 0.0,
+            }
+
+        return {
+            "tool_name": tool_name,
+            "total_calls": total,
+            "success_count": successes,
+            "failure_count": failures,
+            "avg_latency_ms": round(sum(latencies) / len(latencies), 2) if latencies else 0.0,
+            "min_latency_ms": round(min(latencies), 2) if latencies else 0.0,
+            "max_latency_ms": round(max(latencies), 2) if latencies else 0.0,
+            "success_rate": round(successes / total * 100, 2),
         }
 
     def get_snapshot(self) -> dict[str, Any]:
-        """Return a full metrics snapshot for external consumption."""
-        tool_stats = {name: self.get_tool_stats(name) for name in self._tool_metrics}
+        """Return a full metrics snapshot for API/dashboard consumption."""
         return {
-            "tool_stats": tool_stats,
+            "tool_metrics": self.get_tool_metrics(),
             "total_executions": len(self._execution_summaries),
             "recent_executions": self._execution_summaries[-10:],
         }
 
-    # --- Placeholders for future features ---
+    # ---- DB Persistence ----
 
-    def detect_regression(self, tool_name: str, current_duration_ms: int) -> dict[str, Any] | None:
-        """Placeholder: Compare current execution against historical baseline.
+    def flush_to_db(self, db: Session) -> None:
+        """Flush in-memory counters to the tool_metrics DB table.
 
-        Future implementation will:
-          - Maintain rolling averages per tool
-          - Flag regressions when current_duration_ms exceeds baseline by threshold
-          - Return regression details or None if within bounds
+        Uses upsert logic: creates rows for new tools, increments for existing.
         """
-        # TODO: Implement with historical baseline comparison
-        return None
+        now = datetime.now(timezone.utc)
 
-    def emit_ci_webhook(self, event_type: str, payload: dict[str, Any]) -> None:
-        """Placeholder: Send metrics/alerts to CI/CD webhook endpoints.
+        for tool_name in self._tool_calls:
+            calls = self._tool_calls[tool_name]
+            successes = self._tool_successes[tool_name]
+            failures = self._tool_failures[tool_name]
+            latencies = self._tool_latencies.get(tool_name, [])
 
-        Future implementation will:
-          - POST to configured webhook URL
-          - Include event_type, payload, and system metadata
-          - Support retry on transient failures
-        """
-        # TODO: Implement webhook dispatch
-        logger.debug("CI webhook placeholder: event_type='%s'", event_type)
+            if calls == 0:
+                continue
 
-    def persist_to_database(self) -> None:
-        """Placeholder: Persist in-memory metrics to PostgreSQL.
+            total_latency = sum(latencies)
+            min_lat = min(latencies) if latencies else 0.0
+            max_lat = max(latencies) if latencies else 0.0
 
-        Future implementation will:
-          - Batch insert tool metrics
-          - Update rolling aggregates
-          - Prune entries older than retention period
-        """
-        # TODO: Implement database persistence
-        logger.debug("Database persistence placeholder called.")
+            existing = db.query(ToolMetrics).filter(ToolMetrics.tool_name == tool_name).first()
+
+            if existing:
+                existing.total_calls += calls
+                existing.success_count += successes
+                existing.failure_count += failures
+                existing.total_latency_ms += total_latency
+                existing.min_latency_ms = min(existing.min_latency_ms, min_lat) if existing.total_calls > calls else min_lat
+                existing.max_latency_ms = max(existing.max_latency_ms, max_lat)
+                existing.last_executed_at = now
+            else:
+                new_record = ToolMetrics(
+                    tool_name=tool_name,
+                    total_calls=calls,
+                    success_count=successes,
+                    failure_count=failures,
+                    total_latency_ms=total_latency,
+                    min_latency_ms=min_lat,
+                    max_latency_ms=max_lat,
+                    last_executed_at=now,
+                )
+                db.add(new_record)
+
+        db.commit()
+
+        # Reset in-memory counters after flush
+        self._tool_calls.clear()
+        self._tool_successes.clear()
+        self._tool_failures.clear()
+        self._tool_latencies.clear()
+
+        logger.info("Flushed tool metrics to database.")
+
+    @staticmethod
+    def get_tool_metrics_from_db(db: Session, tool_name: str | None = None) -> dict[str, Any]:
+        """Read authoritative tool metrics from the database."""
+        if tool_name:
+            record = db.query(ToolMetrics).filter(ToolMetrics.tool_name == tool_name).first()
+            if record:
+                return record.to_dict()
+            return {"tool_name": tool_name, "total_calls": 0, "note": "No data yet."}
+
+        records = db.query(ToolMetrics).all()
+        return {r.tool_name: r.to_dict() for r in records}
 
 
-# Module-level singleton for convenience
+# Module-level singleton
 metrics_collector = MetricsCollector()

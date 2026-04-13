@@ -6,3 +6,4 @@ redis==5.2.1
 rq==1.16.2
 requests==2.32.3
 pydantic-settings==2.8.1
+groq==0.20.0

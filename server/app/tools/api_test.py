@@ -1,10 +1,9 @@
-"""API Test Tool — generates dynamic test cases and returns structured results.
+"""API Test Tool — runs endpoint tests and returns structured results.
 
 Test categories:
   - valid_request: Tests with the provided payload as-is.
   - missing_fields: Tests with required fields removed.
   - invalid_types: Tests with wrong types for every field.
-  - edge_values: Tests with boundary/edge-case inputs (empty body, special chars, etc.).
 
 Returns:
   {
@@ -18,11 +17,12 @@ Returns:
 import json
 import time
 from typing import Any
+from urllib.parse import urljoin
 
 import requests
 
 REQUEST_TIMEOUT = (5, 15)  # (connect_timeout, read_timeout)
-SUPPORTED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
+SUPPORTED_METHODS = {"GET", "POST"}
 
 
 def _parse_input(tool_input: Any) -> dict[str, Any]:
@@ -83,57 +83,56 @@ def _send_request(method: str, url: str, headers: dict[str, str], body: Any) -> 
     return response.status_code, latency_ms
 
 
-def _generate_test_cases(base_payload: dict[str, Any]) -> list[tuple[str, dict[str, Any], bool]]:
-    """Generate dynamic test cases. Returns list of (name, payload, expects_failure)."""
+def _build_target_urls(payload: dict[str, Any]) -> list[str]:
+    endpoint_urls = payload.get("endpoint_urls")
+    if isinstance(endpoint_urls, list):
+        urls = [u.strip() for u in endpoint_urls if isinstance(u, str) and u.strip()]
+        if urls:
+            return urls
 
-    cases: list[tuple[str, dict[str, Any], bool]] = []
+    api_base_url = payload.get("api_base_url")
+    endpoints = payload.get("endpoints")
+    if isinstance(api_base_url, str) and api_base_url.strip() and isinstance(endpoints, list):
+        built_urls: list[str] = []
+        for endpoint in endpoints:
+            if isinstance(endpoint, str) and endpoint.strip():
+                full_url = urljoin(f"{api_base_url.rstrip('/')}/", endpoint.lstrip("/"))
+                built_urls.append(full_url)
+        if built_urls:
+            return built_urls
 
-    # 1. Valid request — the original payload, expects success
-    cases.append(("valid_request", dict(base_payload), False))
+    url = payload.get("url")
+    if isinstance(url, str) and url.strip():
+        return [url.strip()]
 
-    # 2. Missing fields — remove url to trigger validation failure
-    missing = {
-        "method": base_payload.get("method"),
-        "headers": base_payload.get("headers"),
-        "body": base_payload.get("body"),
-    }
-    cases.append(("missing_fields", missing, True))
+    return []
 
-    # 3. Invalid types — wrong types for every field
-    invalid_types = {
-        "url": 123,
-        "method": 456,
-        "headers": "invalid",
-        "body": base_payload.get("body"),
-    }
-    cases.append(("invalid_types", invalid_types, True))
 
-    # 4. Edge values — empty body
-    edge_empty_body = {
-        "url": base_payload.get("url"),
-        "method": base_payload.get("method"),
-        "headers": base_payload.get("headers"),
-        "body": {},
-    }
-    cases.append(("edge_empty_body", edge_empty_body, False))
+def _generate_test_cases(base_payload: dict[str, Any], target_urls: list[str]) -> list[tuple[str, dict[str, Any], bool, str]]:
+    """Generate test cases per target: valid request, missing fields, invalid types."""
+    cases: list[tuple[str, dict[str, Any], bool, str]] = []
 
-    # 5. Edge values — special characters in body
-    edge_special_chars = {
-        "url": base_payload.get("url"),
-        "method": base_payload.get("method"),
-        "headers": base_payload.get("headers"),
-        "body": {"key": "<script>alert('xss')</script>", "sql": "'; DROP TABLE users; --"},
-    }
-    cases.append(("edge_special_chars", edge_special_chars, False))
+    resolved_targets = target_urls if target_urls else [str(base_payload.get("url", ""))]
 
-    # 6. Edge values — oversized field value
-    edge_oversized = {
-        "url": base_payload.get("url"),
-        "method": base_payload.get("method"),
-        "headers": base_payload.get("headers"),
-        "body": {"data": "x" * 10_000},
-    }
-    cases.append(("edge_oversized_payload", edge_oversized, False))
+    for target_url in resolved_targets:
+        valid_payload = dict(base_payload)
+        valid_payload["url"] = target_url
+        cases.append(("valid_request", valid_payload, False, target_url))
+
+        missing_payload = {
+            "method": base_payload.get("method"),
+            "headers": base_payload.get("headers"),
+            "body": base_payload.get("body"),
+        }
+        cases.append(("missing_fields", missing_payload, True, target_url))
+
+        invalid_types_payload = {
+            "url": 123,
+            "method": 456,
+            "headers": "invalid",
+            "body": base_payload.get("body"),
+        }
+        cases.append(("invalid_types", invalid_types_payload, True, target_url))
 
     return cases
 
@@ -142,6 +141,7 @@ def _run_single_case(
     case_name: str,
     case_payload: dict[str, Any],
     expects_failure: bool,
+    target_url: str,
 ) -> dict[str, Any]:
     """Execute a single test case and return the structured result."""
 
@@ -151,6 +151,7 @@ def _run_single_case(
         case_passed = expects_failure
         return {
             "name": case_name,
+            "target_url": target_url,
             "status": "passed" if case_passed else "failed",
             "latency_ms": 0,
             "http_status": None,
@@ -170,6 +171,7 @@ def _run_single_case(
             case_passed = http_status < 400
         return {
             "name": case_name,
+            "target_url": target_url,
             "status": "passed" if case_passed else "failed",
             "latency_ms": latency_ms,
             "http_status": http_status,
@@ -178,6 +180,7 @@ def _run_single_case(
     except requests.RequestException as exc:
         return {
             "name": case_name,
+            "target_url": target_url,
             "status": "failed",
             "latency_ms": 0,
             "http_status": None,
@@ -192,16 +195,20 @@ def run_api_test(tool_input: Any) -> dict[str, Any]:
 
     base_payload: dict[str, Any] = {
         "url": payload.get("url", ""),
+        "api_base_url": payload.get("api_base_url", ""),
         "method": str(payload.get("method", "GET")).upper(),
         "headers": payload.get("headers") if isinstance(payload.get("headers"), dict) else {},
         "body": payload.get("body"),
+        "endpoints": payload.get("endpoints") if isinstance(payload.get("endpoints"), list) else [],
+        "endpoint_urls": payload.get("endpoint_urls") if isinstance(payload.get("endpoint_urls"), list) else [],
     }
 
-    generated_cases = _generate_test_cases(base_payload)
+    target_urls = _build_target_urls(base_payload)
+    generated_cases = _generate_test_cases(base_payload, target_urls)
     test_cases: list[dict[str, Any]] = []
 
-    for case_name, case_payload, expects_failure in generated_cases:
-        result = _run_single_case(case_name, case_payload, expects_failure)
+    for case_name, case_payload, expects_failure, target_url in generated_cases:
+        result = _run_single_case(case_name, case_payload, expects_failure, target_url)
         test_cases.append(result)
 
     passed_count = sum(1 for case in test_cases if case["status"] == "passed")
@@ -216,9 +223,10 @@ def run_api_test(tool_input: Any) -> dict[str, Any]:
 
     return {
         "target": {
-            "url": base_payload.get("url"),
+            "url": base_payload.get("url") or base_payload.get("api_base_url"),
             "method": base_payload.get("method"),
         },
+        "targets": target_urls,
         "test_cases": test_cases,
         "summary": {
             "total": len(test_cases),

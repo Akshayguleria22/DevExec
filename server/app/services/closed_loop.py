@@ -1,4 +1,4 @@
-"""Closed-Loop Execution Service — diagnostic feedback loop with before/after comparison.
+"""Closed-Loop Execution Service — diagnostic feedback loop with memory and regression.
 
 Flow:
   1. Run api_test with original input
@@ -7,13 +7,18 @@ Flow:
   4. Modify test conditions (simulate applying the fix)
   5. Re-run api_test with modified conditions
   6. Compare before vs after: success rate delta, latency delta
+  7. Record to execution memory + check for regression
+  8. Feed tool metrics collector
 """
 
 import copy
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from app.services.metrics_collector import metrics_collector
+from app.services.regression_detector import check_regression
 from app.tools.api_test import run_api_test
 from app.tools.log_analysis import analyze_logs
 
@@ -28,7 +33,6 @@ def _extract_failure_logs(api_result: dict[str, Any]) -> str:
     """Extract failure details from an api_test result as log text for analysis."""
     failures = api_result.get("failures", [])
     if not failures:
-        # Fall back to checking test_cases directly
         failures = [
             {"name": tc["name"], "error": tc.get("error", "unknown")}
             for tc in api_result.get("test_cases", [])
@@ -53,20 +57,11 @@ def _apply_fix_to_input(
     original_input: dict[str, Any],
     analysis: dict[str, Any],
 ) -> dict[str, Any]:
-    """Simulate applying the suggested fix to the test input.
-
-    Based on the error_type from analysis, modify the input to address the issue:
-      - timeout: reduce request scope (remove heavy body)
-      - auth_error: add placeholder auth header
-      - validation_error: fix body structure
-      - server_error: simplify request
-      - unknown: no modification
-    """
+    """Simulate applying the suggested fix to the test input."""
     modified = copy.deepcopy(original_input)
     error_type = analysis.get("error_type", "unknown")
 
     if error_type == "timeout":
-        # Simulate fix: simplify payload to reduce server load
         modified["body"] = None
         if "headers" not in modified:
             modified["headers"] = {}
@@ -74,14 +69,12 @@ def _apply_fix_to_input(
         logger.info("Applied timeout fix: removed body, added timeout budget header.")
 
     elif error_type == "auth_error":
-        # Simulate fix: add authorization header
         if "headers" not in modified:
             modified["headers"] = {}
         modified["headers"]["Authorization"] = "Bearer <corrected-token>"
         logger.info("Applied auth fix: added authorization header.")
 
     elif error_type == "validation_error":
-        # Simulate fix: ensure body has required structure
         if modified.get("body") is None:
             modified["body"] = {}
         if isinstance(modified["body"], dict):
@@ -89,7 +82,6 @@ def _apply_fix_to_input(
         logger.info("Applied validation fix: ensured body structure.")
 
     elif error_type == "server_error":
-        # Simulate fix: simplify request
         modified["body"] = None
         modified["method"] = "GET"
         logger.info("Applied server error fix: simplified request to GET with no body.")
@@ -127,24 +119,41 @@ def _compute_improvement(
     }
 
 
-def execute_closed_loop(task_input: dict[str, Any]) -> dict[str, Any]:
-    """Run the full closed-loop diagnostic flow.
+def _build_run_metrics(summary: dict[str, Any], duration_ms: int) -> dict[str, Any]:
+    """Build a metrics dict from an api_test summary for memory/regression."""
+    total = summary.get("total", 0)
+    passed = summary.get("passed", 0)
+    failed = summary.get("failed", 0)
+    return {
+        "success_rate": round(passed / total * 100, 2) if total > 0 else 0.0,
+        "latency_ms": summary.get("latency_ms", 0.0),
+        "total_tests": total,
+        "passed_tests": passed,
+        "failed_tests": failed,
+        "total_retries": 0,
+        "duration_ms": duration_ms,
+    }
+
+
+def execute_closed_loop(
+    task_input: dict[str, Any],
+    db_session: Any = None,
+) -> dict[str, Any]:
+    """Run the full closed-loop diagnostic flow with memory and regression.
 
     Args:
         task_input: dict with keys: url, method, headers, body, (optional) logs
+        db_session: Optional SQLAlchemy session for execution memory persistence.
 
     Returns:
         {
             "before": {...api_test result...},
             "after": {...api_test result...},
-            "improvement": {"success_delta": ..., "latency_delta_ms": ...},
-            "analysis": {...log_analysis result...},
-            "execution_trace": {
-                "steps": [...],
-                "start_time": ...,
-                "end_time": ...,
-                "duration_ms": ...,
-            }
+            "improvement": {...},
+            "analysis": {...},
+            "regression": {...},
+            "tool_metrics": {...},
+            "execution_trace": {...}
         }
     """
     trace_steps: list[dict[str, Any]] = []
@@ -161,13 +170,17 @@ def execute_closed_loop(task_input: dict[str, Any]) -> dict[str, Any]:
     }
     before_result = run_api_test(before_input)
     step1_end = _utc_now()
+    step1_duration = int((step1_end - step1_start).total_seconds() * 1000)
     trace_steps.append({
         "step": "api_test_before",
         "start_time": step1_start.isoformat(),
         "end_time": step1_end.isoformat(),
-        "duration_ms": int((step1_end - step1_start).total_seconds() * 1000),
+        "duration_ms": step1_duration,
         "status": "completed",
     })
+
+    # Feed tool metrics
+    metrics_collector.record_tool_execution("api_test", step1_duration, True)
 
     before_summary = before_result.get("summary", {})
     before_failures = before_result.get("failures", [])
@@ -186,21 +199,22 @@ def execute_closed_loop(task_input: dict[str, Any]) -> dict[str, Any]:
 
         failure_logs = _extract_failure_logs(before_result)
 
-        # If the user provided explicit logs, combine them
         explicit_logs = task_input.get("logs")
         if explicit_logs and isinstance(explicit_logs, str):
             failure_logs = f"{explicit_logs}\n---\n{failure_logs}"
 
         analysis_result = analyze_logs({"logs": failure_logs})
         step2_end = _utc_now()
+        step2_duration = int((step2_end - step2_start).total_seconds() * 1000)
         trace_steps.append({
             "step": "log_analysis",
             "start_time": step2_start.isoformat(),
             "end_time": step2_end.isoformat(),
-            "duration_ms": int((step2_end - step2_start).total_seconds() * 1000),
+            "duration_ms": step2_duration,
             "status": "completed",
             "input_log_length": len(failure_logs),
         })
+        metrics_collector.record_tool_execution("log_analysis", step2_duration, True)
 
     # ---- Step 4: Modify test conditions (simulate fix) ----
     step4_start = _utc_now()
@@ -221,13 +235,15 @@ def execute_closed_loop(task_input: dict[str, Any]) -> dict[str, Any]:
     logger.info("Closed-loop Step 5: Running post-fix api_test.")
     after_result = run_api_test(modified_input)
     step5_end = _utc_now()
+    step5_duration = int((step5_end - step5_start).total_seconds() * 1000)
     trace_steps.append({
         "step": "api_test_after",
         "start_time": step5_start.isoformat(),
         "end_time": step5_end.isoformat(),
-        "duration_ms": int((step5_end - step5_start).total_seconds() * 1000),
+        "duration_ms": step5_duration,
         "status": "completed",
     })
+    metrics_collector.record_tool_execution("api_test", step5_duration, True)
 
     after_summary = after_result.get("summary", {})
 
@@ -246,6 +262,40 @@ def execute_closed_loop(task_input: dict[str, Any]) -> dict[str, Any]:
     loop_end = _utc_now()
     total_duration = int((loop_end - loop_start).total_seconds() * 1000)
 
+    # ---- Step 7: Execution memory + regression detection ----
+    regression_result: dict[str, Any] | None = None
+    after_metrics = _build_run_metrics(after_summary, total_duration)
+
+    if db_session is not None:
+        try:
+            from app.services.execution_memory import get_latest_run, record_run
+
+            input_key = json.dumps(task_input, sort_keys=True)
+            prev_run = get_latest_run(db_session, input_key)
+
+            record_run(
+                db=db_session,
+                task_id=None,
+                task_input=input_key,
+                metrics=after_metrics,
+                execution_trace={
+                    "steps": trace_steps,
+                    "start_time": loop_start.isoformat(),
+                    "end_time": loop_end.isoformat(),
+                    "duration_ms": total_duration,
+                },
+            )
+
+            prev_metrics = prev_run["metrics"] if prev_run else None
+            regression_result = check_regression(after_metrics, prev_metrics)
+
+            metrics_collector.flush_to_db(db_session)
+
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to record closed-loop memory/regression: %s", exc)
+    else:
+        regression_result = check_regression(after_metrics, None)
+
     logger.info(
         "Closed-loop completed in %dms. Success delta: %+.1f%%, Latency delta: %+.1fms.",
         total_duration,
@@ -258,6 +308,8 @@ def execute_closed_loop(task_input: dict[str, Any]) -> dict[str, Any]:
         "after": after_result,
         "improvement": improvement,
         "analysis": analysis_result,
+        "regression": regression_result,
+        "tool_metrics": metrics_collector.get_tool_metrics(),
         "execution_trace": {
             "steps": trace_steps,
             "start_time": loop_start.isoformat(),

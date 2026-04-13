@@ -14,17 +14,29 @@ app/
   models/
     task.py                       # Task ORM model (with execution_trace, metrics, retry_count)
     execution.py                  # ExecutionResult + StepResult dataclasses
+    deployment_event.py           # Deployment webhook event linkage table
+    execution_event.py            # Ordered execution event stream table (seq)
+    processed_webhook.py          # Idempotency table for delivery IDs
   schemas/
     task.py                       # Pydantic schemas (TaskCreate, TaskRead, ClosedLoop*)
+    webhook.py                    # Webhook request/response contracts
   api/
     routes/
       tasks.py                    # REST endpoints
+      webhook.py                  # Secure deployment webhook endpoint
+      events.py                   # Event replay + websocket streaming
   services/
     task_service.py               # Task CRUD + lifecycle
     execution_engine.py           # Hardened step runner (retry, validation, timing)
     planner.py                    # Rule-based task planning
     closed_loop.py                # Closed-loop diagnostic execution
     metrics_collector.py          # Performance tracking + regression detection (placeholder)
+    event_stream.py               # Persistent + pub/sub event emitter
+    webhook_security.py           # GitHub HMAC signature validation
+    webhook_idempotency.py        # Delivery registration and dedupe
+    webhook_service.py            # Webhook task generation and deployment linking
+    report_service.py             # Task summary + JSON/Markdown report builders
+    notification_service.py       # Outbound webhook and optional GitHub PR notifications
   tools/
     registry.py                   # Tool registry with metadata
     api_test.py                   # Dynamic API test suite generator
@@ -40,6 +52,9 @@ app/
 
 - `POST /tasks` — Create and enqueue a task
 - `GET /tasks/{id}` — Get task status, result, execution trace, and metrics
+- `GET /tasks/{id}/summary` — Compact execution summary for dashboards/alerts
+- `GET /tasks/{id}/report` — Full JSON report (failures, regression, fixes, metrics)
+- `GET /tasks/{id}/report?format=markdown` — Markdown report (for PR comments/chat tools)
 
 ### Closed-Loop Execution
 
@@ -54,6 +69,13 @@ app/
 
 - `GET /tasks/meta/tools` — List registered tools with metadata
 - `GET /tasks/meta/metrics` — Metrics snapshot for monitoring/CI
+
+### Webhook + Events
+
+- `POST /webhook/deploy` — Secure webhook intake (GitHub-style signature + idempotency)
+  - Accepts native GitHub push/pull_request payloads and extracts `repo`, `branch`, and `commit`
+- `GET /tasks/{id}/events` — Ordered persisted execution events (`seq`)
+- `WS /ws/tasks/{id}` — Replay + realtime event stream
 
 ### Health
 
@@ -130,25 +152,38 @@ POST /tasks/closed-loop
 
 ## Setup Instructions
 
-### 1. Install dependencies
+### 1. Configure environment
+
+The project now includes [.env](.env) with all required variables:
+
+- PostgreSQL: `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_PORT`
+- Redis: `REDIS_PORT`, `REDIS_URL`
+- App/runtime: `DATABASE_URL`, `RQ_QUEUE_NAME`, `WEBHOOK_SECRET`
+- Notifications: `NOTIFICATION_WEBHOOK_URL`, `NOTIFICATION_TIMEOUT_SECONDS`
+- GitHub integration: `GITHUB_TOKEN`, `GITHUB_API_BASE_URL`, `ENABLE_GITHUB_PR_COMMENT`
+- Groq: `GROQ_API_KEY`, `GROQ_MODEL`, `GROQ_BASE_URL`
+
+Set your real secrets before production use.
+
+### 2. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Run PostgreSQL + Redis
+### 3. Run PostgreSQL + Redis
 
 ```bash
 docker compose up -d postgres redis
 ```
 
-### 3. Run FastAPI API server
+### 4. Run FastAPI API server
 
 ```bash
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### 4. Run worker
+### 5. Run worker
 
 Use a separate terminal:
 
@@ -164,6 +199,21 @@ python -m app.workers.worker
 - **Fallback output**: Safe defaults when a tool fails completely
 - **Structured warnings**: Partial failures collected and persisted
 - **Full timing**: Per-step and overall `start_time`, `end_time`, `duration_ms`
+- **Ordered events**: Every event gets deterministic `seq` ordering
+- **Replay reliability**: websocket clients receive `replay_start` then historical events in sequence
+
+## Webhook Security + Reliability
+
+- **Signature verification**: Validates `X-Hub-Signature-256` using HMAC SHA256 and shared secret
+- **Idempotency**: Deduplicates repeated deliveries using `X-GitHub-Delivery`
+- **Optional task dedupe**: Reuses task for same `repo_name + commit_sha + api_base_url`
+- **GitHub context capture**: Persists event/repo/branch/commit/PR metadata into task input for downstream reporting
+
+## Notifications + Reports
+
+- **Webhook notifications**: emits `task_completed`, `failure_detected`, and `regression_detected`
+- **GitHub PR comments (optional)**: posts markdown report when `ENABLE_GITHUB_PR_COMMENT=true`
+- **Report artifact endpoints**: machine JSON and human-readable markdown for each task
 
 ## Notes
 

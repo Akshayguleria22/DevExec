@@ -2,35 +2,43 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: Devexec
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: A1k2s3h4a5y6
+      POSTGRES_DB: ${POSTGRES_DB:-Devexec}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-A1k2s3h4a5y6}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
 
   backend:
     image: python:3.12-slim
     working_dir: /app
     volumes:
       - ./:/app
+    env_file:
+      - .env
     environment:
-      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/devexec
-      REDIS_URL: redis://redis:6379/0
+      APP_NAME: ${APP_NAME:-DevExec Sentinel}
+      DATABASE_URL: ${DATABASE_URL_DOCKER:-postgresql+psycopg://postgres:A1k2s3h4a5y6@postgres:5432/Devexec}
+      REDIS_URL: ${REDIS_URL_DOCKER:-redis://redis:6379/0}
+      RQ_QUEUE_NAME: ${RQ_QUEUE_NAME:-devexec_tasks}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.1-70b-versatile}
+      GROQ_BASE_URL: ${GROQ_BASE_URL:-https://api.groq.com/openai/v1}
     depends_on:
       - postgres
       - redis
     command: >
       sh -c "pip install --no-cache-dir -r requirements.txt &&
-             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+             uvicorn app.main:app --host ${UVICORN_HOST:-0.0.0.0} --port ${UVICORN_PORT:-8000}"
     ports:
-      - "8000:8000"
+      - "${UVICORN_PORT:-8000}:8000"
 
 volumes:
   postgres_data:

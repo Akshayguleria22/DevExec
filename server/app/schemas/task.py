@@ -39,10 +39,34 @@ class ClosedLoopRequest(BaseModel):
 
 
 class ClosedLoopResponse(BaseModel):
-    """Response from the closed-loop execution."""
+    """Response from the closed-loop execution with memory and regression."""
 
     before: dict[str, Any]
     after: dict[str, Any]
     improvement: dict[str, Any]
     analysis: dict[str, Any]
+    regression: dict[str, Any] | None = None
+    tool_metrics: dict[str, Any] | None = None
     execution_trace: dict[str, Any]
+
+
+class ExecutionHistoryResponse(BaseModel):
+    """Response for history lookup endpoint."""
+
+    fingerprint: str
+    count: int
+    runs: list[dict[str, Any]]
+
+
+class ToolMetricsResponse(BaseModel):
+    """Response for DB-persisted tool metrics."""
+
+    tool_name: str
+    total_calls: int
+    success_count: int
+    failure_count: int
+    avg_latency_ms: float
+    min_latency_ms: float
+    max_latency_ms: float
+    success_rate: float
+    last_executed_at: str | None = None
