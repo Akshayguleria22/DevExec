@@ -1,12 +1,10 @@
-version: "3.9"
-
 services:
   postgres:
     image: postgres:16-alpine
     environment:
       POSTGRES_DB: Devexec
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: A1k2s3h4a5y6
     ports:
       - "5432:5432"
     volumes:

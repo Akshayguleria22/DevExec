@@ -1,9 +1,21 @@
+"""Task Planner — rule-based plan generation using tool registry metadata.
+
+Determines which tools to run and in which order based on structured
+or natural language task input.
+"""
+
 import json
 import re
 from typing import Any
 
-SUPPORTED_TOOLS = {"api_test", "log_analysis"}
+from app.tools.registry import TOOLS
+
 URL_PATTERN = re.compile(r"https?://[^\s\"']+")
+
+
+def _get_supported_tools() -> set[str]:
+    """Pull supported tool names from the registry instead of hardcoding."""
+    return set(TOOLS.keys())
 
 
 def _parse_structured_input(task_input: str) -> dict[str, Any]:
@@ -39,13 +51,14 @@ def _normalize_method(parsed: dict[str, Any]) -> str:
 
 
 def _sanitize_plan(plan: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    supported = _get_supported_tools()
     sanitized_plan: list[dict[str, Any]] = []
 
     for step in plan:
         tool_name = step.get("tool")
         step_input = step.get("input")
 
-        if tool_name not in SUPPORTED_TOOLS:
+        if tool_name not in supported:
             continue
 
         if not isinstance(step_input, dict):

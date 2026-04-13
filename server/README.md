@@ -1,67 +1,132 @@
 # DevExec Sentinel Backend
 
-Production-ready backend foundation for async developer task execution using FastAPI, PostgreSQL, Redis, and RQ.
+Production-ready backend for async developer task execution using FastAPI, PostgreSQL, Redis, and RQ.
 
-## Structure
+## Architecture
 
 ```text
 app/
-  main.py
+  main.py                         # FastAPI application factory
   core/
-    config.py
-    database.py
-    redis.py
+    config.py                     # Pydantic settings
+    database.py                   # SQLAlchemy engine + session
+    redis.py                      # Redis connection + RQ queue
   models/
-    task.py
-    execution.py
+    task.py                       # Task ORM model (with execution_trace, metrics, retry_count)
+    execution.py                  # ExecutionResult + StepResult dataclasses
   schemas/
-    task.py
+    task.py                       # Pydantic schemas (TaskCreate, TaskRead, ClosedLoop*)
   api/
     routes/
-      tasks.py
+      tasks.py                    # REST endpoints
   services/
-    task_service.py
-    execution_engine.py
+    task_service.py               # Task CRUD + lifecycle
+    execution_engine.py           # Hardened step runner (retry, validation, timing)
+    planner.py                    # Rule-based task planning
+    closed_loop.py                # Closed-loop diagnostic execution
+    metrics_collector.py          # Performance tracking + regression detection (placeholder)
   tools/
-    registry.py
-    api_test.py
-    log_analysis.py
+    registry.py                   # Tool registry with metadata
+    api_test.py                   # Dynamic API test suite generator
+    log_analysis.py               # Error classifier with confidence scoring
   workers/
-    worker.py
-    task_worker.py
-requirements.txt
-docker-compose.yml
-README.md
+    worker.py                     # RQ worker runner
+    task_worker.py                # Task processing with trace persistence
 ```
 
-## API
+## API Endpoints
 
-- `POST /tasks`
-  - Input body:
-    ```json
-    {
-      "input": {
-        "url": "https://httpbin.org/post",
-        "method": "POST",
-        "headers": {"Content-Type": "application/json"},
-        "body": {"name": "devexec"},
-        "logs": "Timeout while connecting to upstream"
-      }
-    }
-    ```
-  - Returns:
-    ```json
-    {
-      "task_id": "<uuid>"
-    }
-    ```
+### Core
 
-- `GET /tasks/{id}`
-  - Returns task status and execution outputs:
-    - `status`
-    - `result`
-    - `warnings`
-    - `step_errors`
+- `POST /tasks` — Create and enqueue a task
+- `GET /tasks/{id}` — Get task status, result, execution trace, and metrics
+
+### Closed-Loop Execution
+
+- `POST /tasks/closed-loop` — Run full diagnostic cycle:
+  1. Run API tests (before)
+  2. Analyze failures with log analysis
+  3. Simulate fix based on error type
+  4. Re-run API tests (after)
+  5. Compare results (success rate delta, latency delta)
+
+### Meta
+
+- `GET /tasks/meta/tools` — List registered tools with metadata
+- `GET /tasks/meta/metrics` — Metrics snapshot for monitoring/CI
+
+### Health
+
+- `GET /health` — Health check
+
+## Example Payloads
+
+### Create Task
+
+```json
+POST /tasks
+{
+  "input": {
+    "url": "https://httpbin.org/post",
+    "method": "POST",
+    "headers": {"Content-Type": "application/json"},
+    "body": {"name": "devexec"},
+    "logs": "Timeout while connecting to upstream"
+  }
+}
+```
+
+### Closed-Loop Execution
+
+```json
+POST /tasks/closed-loop
+{
+  "url": "https://httpbin.org/post",
+  "method": "POST",
+  "headers": {"Content-Type": "application/json"},
+  "body": {"name": "devexec"},
+  "logs": "Timeout while connecting to upstream"
+}
+```
+
+### Example Response (Closed-Loop)
+
+```json
+{
+  "before": {
+    "target": {"url": "https://httpbin.org/post", "method": "POST"},
+    "test_cases": [...],
+    "summary": {"total": 6, "passed": 4, "failed": 2, "latency_ms": 450.5},
+    "failures": [...]
+  },
+  "after": {
+    "target": {"url": "https://httpbin.org/post", "method": "POST"},
+    "test_cases": [...],
+    "summary": {"total": 6, "passed": 5, "failed": 1, "latency_ms": 380.2},
+    "failures": [...]
+  },
+  "improvement": {
+    "success_rate_before": 66.67,
+    "success_rate_after": 83.33,
+    "success_delta": 16.67,
+    "latency_before_ms": 450.5,
+    "latency_after_ms": 380.2,
+    "latency_delta_ms": -70.3
+  },
+  "analysis": {
+    "error_type": "timeout",
+    "confidence": 71,
+    "root_cause": "Service call exceeded expected response time.",
+    "suggestion": "Check downstream availability, network latency, and timeout configuration."
+  },
+  "execution_trace": {
+    "steps": [...],
+    "start_time": "2026-04-13T18:30:00+00:00",
+    "end_time": "2026-04-13T18:30:02+00:00",
+    "duration_ms": 2150
+  }
+}
+```
 
 ## Setup Instructions
 
@@ -91,19 +156,17 @@ Use a separate terminal:
 python -m app.workers.worker
 ```
 
-## Optional: Run backend service in Docker Compose
+## Execution Engine Features
 
-```bash
-docker compose up backend
-```
+- **Strict step contract**: Each step returns `{success, data, error}`
+- **Retry logic**: Max 2 attempts per step (retries on exception or invalid output)
+- **Output validation**: Per-tool required key enforcement
+- **Fallback output**: Safe defaults when a tool fails completely
+- **Structured warnings**: Partial failures collected and persisted
+- **Full timing**: Per-step and overall `start_time`, `end_time`, `duration_ms`
 
 ## Notes
 
 - Queue name: `devexec_tasks`
-- Task records are stored in PostgreSQL table `tasks`.
-- Worker flow:
-  - load task
-  - set `running`
-  - execute tools via execution engine
-  - store `result`, `warnings`, `step_errors`
-  - mark `completed` or `failed`
+- Task records stored in PostgreSQL table `tasks`
+- Worker flow: load task → set `running` → execute → persist trace + metrics → mark `completed`/`failed`
