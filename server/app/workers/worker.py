@@ -10,10 +10,10 @@ from app.core.redis import redis_connection
 def run_worker() -> None:
     with Connection(redis_connection):
         if os.name == "nt":
-            worker = SimpleWorker([settings.rq_queue_name])
+            worker = SimpleWorker([settings.rq_queue_name, settings.agent_queue_name])
             worker.death_penalty_class = TimerDeathPenalty
         else:
-            worker = Worker([settings.rq_queue_name])
+            worker = Worker([settings.rq_queue_name, settings.agent_queue_name])
         worker.work()
 
 

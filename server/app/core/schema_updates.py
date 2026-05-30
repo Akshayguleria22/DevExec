@@ -29,6 +29,12 @@ def apply_schema_updates(engine: Engine) -> None:
         "ALTER TABLE execution_events ALTER COLUMN seq SET NOT NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_execution_events_task_seq ON execution_events (task_id, seq)",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_processed_webhooks_delivery_id ON processed_webhooks (delivery_id)",
+        "ALTER TABLE execution_artifacts ADD COLUMN IF NOT EXISTS agent_execution_id UUID",
+        "CREATE INDEX IF NOT EXISTS ix_execution_artifacts_agent_execution_id ON execution_artifacts (agent_execution_id)",
+        "ALTER TABLE execution_artifacts ALTER COLUMN session_id DROP NOT NULL",
+        "ALTER TABLE tool_invocations ADD COLUMN IF NOT EXISTS agent_execution_id UUID",
+        "ALTER TABLE tool_invocations ALTER COLUMN execution_task_id DROP NOT NULL",
+        "CREATE INDEX IF NOT EXISTS ix_tool_invocations_agent_execution_id ON tool_invocations (agent_execution_id)",
     ]
 
     with engine.begin() as connection:
